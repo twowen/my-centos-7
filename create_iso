@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+
+if [[ -n "$TRACE" ]]; then
+  export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+  set -o xtrace
+fi
+
+set -euo pipefail
+IFS=$'\n\t'
+
+CUR_TIME=$(date +%FT%TZ)
+CUSTOM_RPMS=./RPMS
+DVD_LAYOUT=/root/Lanner-QSL-7-iso-layout
+DVD_TITLE='Lanner-QSL-7'
+ISO=CentOS-7.0-1406-x86_64-Minimal.iso
+ISO_DIR=/root/lnx-iso
+ISO_FILENAME=./Lanner-QSL-7.iso
+KS_CFG=./ks.cfg
+ISOLINUX_CFG=./isolinux.cfg
+MIRROR=http://vault.centos.org/centos/7.0.1406/isos/x86_64
+MOUNT_POINT=/mnt/lqsl7
+
+fetch_iso()
+{
+    if [[ ! -d $ISO_DIR ]]; then
+        mkdir -p $ISO_DIR
+    fi
+
+    if [[ ! -e $ISO_DIR/$ISO ]]; then
+        echo "No local copy of $ISO. Fetching latest $ISO"
+        curl -s -o $ISO_DIR/$ISO $MIRROR/$ISO
+    fi
+
+    # Check if we already imported the key
+    #
+    # pub  4096R/F4A80EB5 2014-06-23 CentOS-7 Key (CentOS 7 Official Signing Key) <security@centos.org>
+    #     Key fingerprint = 6341 AB27 53D7 8A78 A7C2  7BB1 24C6 A8A7 F4A8 0EB5
+    set +e
+    gpg --list-keys | grep 4096R/F4A80EB5 > /dev/null
+    if [[ $? -gt 0 ]]; then
+        echo "Adding gpg signing keys"
+        gpg --keyserver pool.sks-keyservers.net --recv-keys 6341AB2753D78A78A7C27BB124C6A8A7F4A80EB5
+    fi
+    set -e
+
+    echo "Checking to see if we have the latest $ISO:"
+    echo "  Getting signed checksum (sha256sum.txt.asc)"
+    curl -L -s -o $ISO_DIR/sha256sum.txt.asc $MIRROR/sha256sum.txt.asc
+
+    #ISO_NAME=$(echo $ISO | cut -f1 -d'.')
+    #CentOS-7.0-1406-x86_64-Minimal.iso -> the result will be CentOS-7 if we used above command
+    ISO_NAME=$(echo $ISO)
+
+    echo "  Verifying signed checksum sha256sum.txt.asc"
+    gpg --verify $ISO_DIR/sha256sum.txt.asc
+
+    CHECKSUM=$(grep $ISO_NAME $ISO_DIR/sha256sum.txt.asc | cut -f1 -d' ')
+
+    if [[ $(sha256sum $ISO_DIR/$ISO | cut -f1 -d' ') == "$CHECKSUM" ]]; then
+        echo "  Checksums match, using local copy of $ISO"
+    else
+        echo "  Checksums do not match. Fetching latest $ISO"
+        curl -s -o $ISO_DIR/$ISO $MIRROR/$ISO
+
+        echo "  Verifying sha256 of $ISO"
+        pushd $PWD
+        cd $ISO_DIR
+        grep "$ISO\$" sha256sum.txt.asc | sha256sum -c -
+        popd
+    fi
+}
+
+create_layout()
+{
+    echo "Creating ISO Layout"
+    if [[ -d $DVD_LAYOUT ]]; then
+        echo "Layout $DVD_LAYOUT exists...nuking"
+        rm -rf $DVD_LAYOUT
+    fi
+    echo "Creating $DVD_LAYOUT"
+    mkdir -p $DVD_LAYOUT
+
+    # Check if $MOUNT_POINT is already mounted
+    # This may happen if a previous build failed
+    if grep -q "$MOUNT_POINT" /proc/mounts; then
+      echo "Unmounting $MOUNT_POINT from previous build..."
+        umount $MOUNT_POINT
+    fi
+
+    echo "Mounting $ISO to $MOUNT_POINT"
+    if [[ ! -d $MOUNT_POINT ]]; then
+        echo "Creating $MOUNT_POINT..."
+        mkdir $MOUNT_POINT
+    fi
+    mount $ISO_DIR/$ISO $MOUNT_POINT -o loop
+    pushd $MOUNT_POINT > /dev/null 2>&1
+    echo "Populating Layout"
+    tar cf - . | tar xpf - -C $DVD_LAYOUT
+    popd > /dev/null 2>&1
+    umount $MOUNT_POINT
+
+    if [[ -d $CUSTOM_RPMS ]]; then
+        echo "Copying custom RPMS"
+        find $CUSTOM_RPMS -type f -exec cp {} $DVD_LAYOUT/Packages \;
+    fi
+
+    echo "Finished Populating Layout"
+}
+
+cleanup_layout()
+{
+    echo "Cleaning up $DVD_LAYOUT"
+    find $DVD_LAYOUT -name TRANS.TBL -exec rm '{}' +
+    COMPS_XML=$(find $DVD_LAYOUT/repodata -name '*-minimal-x86_64-comps.xml' ! -name 'repomd.xml' -exec basename {} \;)
+    mv $DVD_LAYOUT/repodata/$COMPS_XML $DVD_LAYOUT/repodata/comps.xml
+    find $DVD_LAYOUT/repodata -type f ! -name 'comps.xml' -exec rm '{}' +
+}
+
+copy_ks_cfg()
+{
+    echo "Copying Kickstart file"
+    cp $KS_CFG $DVD_LAYOUT/
+}
+
+modify_boot_menu()
+{
+    echo "Modifying grub boot menu"
+    cp $ISOLINUX_CFG $DVD_LAYOUT/isolinux/
+}
+
+create_newiso()
+{
+    cleanup_layout
+    copy_ks_cfg
+    modify_boot_menu
+    echo "Preparing NEW ISO"
+    pushd $DVD_LAYOUT > /dev/null 2>&1
+    createrepo -g repodata/comps.xml $DVD_LAYOUT
+    echo "Creating NEW ISO"
+    mkisofs -r -R -J -T -v \
+     -no-emul-boot -boot-load-size 4 -boot-info-table \
+     -V "$DVD_TITLE" -p "Lanner" \
+     -A "$DVD_TITLE - $CUR_TIME" \
+     -b isolinux/isolinux.bin -c isolinux/boot.cat \
+     -x "lost+found" -o $ISO_FILENAME $DVD_LAYOUT
+    echo "Fixing up NEW ISO"
+    echo implantisomd5 $ISO_FILENAME
+    implantisomd5 $ISO_FILENAME
+    popd > /dev/null 2>&1
+    echo "NEW ISO $ISO_FILENAME is ready"
+}
+
+# main line
+
+usage()
+{
+    cat <<EOF
+Usage:
+        $0 [options] command [command]
+option:
+        -h                    - this usage
+
+Commands:
+        fetch                 - fetch ISO
+        layout                - create layout for new ISO
+        finish                - create the new ISO
+        updks                 - update kickstart config
+
+EOF
+    exit 1
+}
+
+args=$(getopt -o h -n 'build_centos_iso.sh' -- "$@")
+
+if [[ $# == 0 ]]; then
+    usage;
+fi
+
+eval set -- $args
+
+while true ; do
+   case "$1" in
+       -h)
+            usage;
+            break;;
+       --)
+           shift; break;;
+   esac
+done
+
+for arg ; do
+    if [[ $arg = 'fetch' ]] ; then
+        fetch_iso
+    fi
+    if [[ $arg = 'layout' ]] ; then
+        create_layout
+    fi
+    if [[ $arg = 'finish' ]] ; then
+        create_newiso
+    fi
+    if [[ $arg = 'updks' ]] ; then
+        copy_ks_cfg
+    fi
+done
